@@ -94,6 +94,7 @@ pub struct DepositWeth<'info> {
     )]
     pub deposit_state: Account<'info, DepositState>,
 
+    #[account(mint::token_program = token_program)]
     pub weth_mint: InterfaceAccount<'info, Mint>,
     pub token_program: Interface<'info, TokenInterface>,
 
@@ -141,7 +142,7 @@ pub struct WithdrawWeth<'info> {
     )]
     pub deposit_state: Account<'info, DepositState>,        
 
-
+    #[account(mint::token_program = token_program)]
     pub weth_mint: InterfaceAccount<'info, Mint>,
     pub token_program: Interface<'info, TokenInterface>,
 
@@ -187,7 +188,11 @@ fn deposit_weth(ctx: Context<DepositWeth>, amount: u64) -> Result<()> {
 }
 
 fn withdraw_weth(ctx: Context<WithdrawWeth>) -> Result<()> {
-    let seeds = [b"deposit_state".as_ref(), ctx.accounts.depositor.key().as_ref(), &[ctx.bumps.deposit_state]];
+    let seeds = [
+        b"deposit_state", 
+        ctx.accounts.depositor.to_account_info().key.as_ref(), 
+        &[ctx.accounts.deposit_state.bump]
+    ];
     let signer = &[&seeds[..]];
 
     let accounts = TransferChecked{
