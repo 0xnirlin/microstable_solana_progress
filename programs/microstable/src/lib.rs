@@ -51,6 +51,16 @@ pub mod manager {
         Ok(())
     }
 
+    pub fn liquidate(ctx: Context<Liquidate>) -> Result<()> {
+        liquidate_user(ctx)?;
+        Ok(())
+    }
+
+    pub fn burn(ctx: Context<Liquidate>, amount: u64) -> Result<()> {
+        burn_shusd(ctx, amount)?;
+        Ok(())
+    }
+
 }
 
 #[derive(Accounts)]
@@ -260,7 +270,69 @@ pub struct MintShusd<'info> {
     pub vault_weth: InterfaceAccount<'info, TokenAccount>,
 }
 
+#[derive(Accounts)]
+pub struct Liquidate<'info> {
+    #[account(mut)]
+    pub liquidator: Signer<'info>,
 
+    #[account(
+        mut,
+        seeds = [b"state".as_ref()],
+        bump = state.bump
+    )]
+    pub state: Account<'info, State>,
+
+    #[account(mut)]
+    pub price_feed: Account<'info, PriceUpdateV2>,
+
+    #[account(
+        mut,
+        seeds = [b"deposit_state".as_ref(), liquidator.key().as_ref()],
+        bump = deposit_state.bump,
+    )]
+    pub deposit_state: Account<'info, DepositState>,    
+
+    #[account(
+        mut,
+        associated_token::mint = shusd_mint,
+        associated_token::authority = liquidator,
+        associated_token::token_program = token_program,
+    )]
+    pub liquidator_shusd_account: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        init_if_needed,  
+        payer = liquidator,      
+        associated_token::mint = weth_mint,
+        associated_token::authority = liquidator,
+        associated_token::token_program = token_program,
+    )]
+    pub liquidator_weth_account: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        associated_token::mint = weth_mint,
+        associated_token::authority = deposit_state,
+        associated_token::token_program = token_program,
+    )]
+    pub vault_weth: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        mint::token_program = token_program,
+        constraint = shusd_mint.key() == state.shusd_mint
+    )]
+    pub shusd_mint: InterfaceAccount<'info, Mint>,
+
+    #[account(
+        mint::token_program = token_program,
+        constraint = weth_mint.key() == state.weth_mint
+    )]
+    pub weth_mint: InterfaceAccount<'info, Mint>,
+
+    pub token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+}
 
 #[account]
 #[derive(InitSpace)]
@@ -438,4 +510,73 @@ pub enum ErrorCode {
     InvalidAmount,
     #[msg("Math overflow")]
     MathOverflow,
+    #[msg("Position is not eligible for liquidation")]
+    CannotLiquidate,
+}
+
+fn burn_shusd(ctx: Context<Liquidate>, amount: u64) -> Result<()> {
+    // decrease the minted amount from deposit state
+    let deposit_state = &mut ctx.accounts.deposit_state;
+    deposit_state.amount_minted -= amount;
+
+    let cpi_accounts = token_interface::Burn {
+        mint: ctx.accounts.shusd_mint.to_account_info(),
+        from: ctx.accounts.liquidator_shusd_account.to_account_info(),
+        authority: ctx.accounts.liquidator.to_account_info(),
+    };
+
+    let cpi_ctx = CpiContext::new(
+        ctx.accounts.token_program.to_account_info(),
+        cpi_accounts,
+    );
+
+    token_interface::burn(cpi_ctx, amount)?;
+
+    Ok(())
+}
+
+fn liquidate_user(ctx: Context<Liquidate>) -> Result<()> {
+    // Check if collateral ratio is below minimum
+    let collateral_ratio = collateral_ratio(&ctx.accounts.price_feed, &ctx.accounts.deposit_state)?;
+    
+    require!(
+        collateral_ratio < ctx.accounts.state.min_collat_ratio as u128,
+        ErrorCode::CannotLiquidate
+    );
+
+    // Get amounts to burn and transfer
+    let amount_to_burn = ctx.accounts.deposit_state.amount_minted;
+    let collateral_to_transfer = ctx.accounts.deposit_state.amount_deposited;
+
+    // Burn all shUSD tokens
+    burn_shusd(&ctx, amount_to_burn)?;
+
+    // Transfer all WETH to liquidator
+    let seeds = [
+        b"deposit_state".as_ref(), 
+        ctx.accounts.liquidator.key.as_ref(),
+        &[ctx.accounts.deposit_state.bump]
+    ];
+    let signer = &[&seeds[..]];
+
+    let accounts = TransferChecked {
+        from: ctx.accounts.vault_weth.to_account_info(),
+        mint: ctx.accounts.weth_mint.to_account_info(),
+        to: ctx.accounts.liquidator_weth_account.to_account_info(),
+        authority: ctx.accounts.deposit_state.to_account_info(),
+    };
+
+    let cpi_context = CpiContext::new_with_signer(
+        ctx.accounts.token_program.to_account_info(),
+        accounts,
+        signer
+    );
+
+    transfer_checked(cpi_context, collateral_to_transfer, ctx.accounts.weth_mint.decimals)?;
+
+    // Reset deposit state
+    ctx.accounts.deposit_state.amount_minted = 0;
+    ctx.accounts.deposit_state.amount_deposited = 0;
+
+    Ok(())
 }
